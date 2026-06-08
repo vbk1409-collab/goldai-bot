@@ -407,10 +407,32 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ================================================================
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"GoldAI Bot is running!")
+    def log_message(self, format, *args):
+        pass  # Suppress logs
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
 def main():
     if not BOT_TOKEN or BOT_TOKEN=="YOUR_BOT_TOKEN_HERE":
         print("[ERROR] Set BOT_TOKEN env variable"); return
     log.info("GoldAI Bot v4 starting...")
+
+    # Start health check server in background
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+    log.info("Health server started")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))
