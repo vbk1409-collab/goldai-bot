@@ -182,24 +182,44 @@ def calc_confidence(direction, entry, sl):
         breakdown.append((f"⚠️ Stop loss is wide ({sl_dist:.0f} pip) — reduces position size", +5))
 
     # ── REWARD vs RISK ─────────────────────────
-    tp1 = round(entry-sl_dist*1.5,1) if is_sell else round(entry+sl_dist*1.5,1)
-    tp2 = round(entry-sl_dist*2.5,1) if is_sell else round(entry+sl_dist*2.5,1)
-    rr  = 2.5
+    # TP based on nearest key levels, not fixed multipliers
+    sup, res = nearest_levels(entry)
 
-    if sl_dist >= 5:
-        if sl_dist*2.5/sl_dist >= 2.5:
-            score += 15
-            breakdown.append(("✅ Good reward vs risk — worth the trade", +15))
-        elif sl_dist*1.5/sl_dist >= 1.5:
-            score += 8
-            breakdown.append(("⚠️ Reward vs risk is acceptable", +8))
-        else:
-            score -= 12
-            breakdown.append(("❌ Reward too small vs risk — not worth it", -12))
-            suggestions.append(f"Set TP further at {tp2} for a better reward")
+    if is_sell:
+        # TP targets = support levels below entry
+        tp_levels = [l for l,d in sup if l < entry - sl_dist*0.5]
+        tp1 = tp_levels[0] if len(tp_levels) >= 1 else round(entry - sl_dist*1.5, 1)
+        tp2 = tp_levels[1] if len(tp_levels) >= 2 else round(entry - sl_dist*2.5, 1)
+    else:
+        # TP targets = resistance levels above entry
+        tp_levels = [l for l,d in res if l > entry + sl_dist*0.5]
+        tp1 = tp_levels[0] if len(tp_levels) >= 1 else round(entry + sl_dist*1.5, 1)
+        tp2 = tp_levels[1] if len(tp_levels) >= 2 else round(entry + sl_dist*2.5, 1)
+
+    rr1 = round(abs(tp1-entry)/sl_dist, 1) if sl_dist > 0 else 1.5
+    rr2 = round(abs(tp2-entry)/sl_dist, 1) if sl_dist > 0 else 2.5
+    rr  = rr2
+
+    if rr2 >= 2.5:
+        score += 15
+        breakdown.append((f"✅ Good reward vs risk — worth the trade", +15))
+    elif rr2 >= 1.5:
+        score += 8
+        breakdown.append((f"⚠️ Reward vs risk is acceptable", +8))
+    else:
+        score -= 12
+        breakdown.append((f"❌ Reward too small vs risk — not worth it", -12))
+        suggestions.append(f"Target further levels for better reward")
 
     score = max(5, min(95, score))
-    return score, breakdown, suggestions, tp1, tp2, rr
+
+    # Always add timing suggestion
+    if is_sell:
+        suggestions.append("Wait for a rejection candle at entry before entering")
+    else:
+        suggestions.append("Wait for a bounce candle at entry before entering")
+
+    return score, breakdown, suggestions, tp1, tp2, rr1, rr2
 
 # ================================================================
 # FORMAT
@@ -215,7 +235,7 @@ def get_verdict(score):
     if score >= 40: return "🔴 WEAK"
     return "⛔ AVOID"
 
-def format_result(direction, entry, sl, score, breakdown, suggestions, tp1, tp2, rr):
+def format_result(direction, entry, sl, score, breakdown, suggestions, tp1, tp2, rr1, rr2):
     em = "📉" if direction.upper()=="SELL" else "📈"
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━",
@@ -228,8 +248,9 @@ def format_result(direction, entry, sl, score, breakdown, suggestions, tp1, tp2,
         lines.append(reason)
     lines += [
         "",
-        f"SL: {sl} | TP1: {tp1} | TP2: {tp2}",
-        f"RR: 1:{rr}",
+        f"SL:  {sl}",
+        f"TP1: {tp1}  (RR 1:{rr1})",
+        f"TP2: {tp2}  (RR 1:{rr2})",
     ]
     if suggestions:
         lines += ["", "💡 How to improve:"]
@@ -297,9 +318,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     direction, entry, sl = result
     await update.message.reply_text("Analyzing... ⏳")
-    score, breakdown, suggestions, tp1, tp2, rr = calc_confidence(direction, entry, sl)
+    score, breakdown, suggestions, tp1, tp2, rr1, rr2 = calc_confidence(direction, entry, sl)
     await update.message.reply_text(
-        format_result(direction, entry, sl, score, breakdown, suggestions, tp1, tp2, rr)
+        format_result(direction, entry, sl, score, breakdown, suggestions, tp1, tp2, rr1, rr2)
     )
 
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -313,15 +334,15 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for level, desc in res:
         if abs(level-current) < 50:
             sl = round(level+22,1)
-            score, bd, sg, tp1, tp2, rr = calc_confidence("SELL",level,sl)
+            score, bd, sg, tp1, tp2, rr1, rr2 = calc_confidence("SELL",level,sl)
             if score >= 55:
-                setups.append({"dir":"SELL","entry":level,"sl":sl,"tp2":tp2,"rr":rr,"score":score,"desc":desc})
+                setups.append({"dir":"SELL","entry":level,"sl":sl,"tp2":tp2,"rr":rr2,"score":score,"desc":desc})
     for level, desc in sup:
         if abs(current-level) < 50:
             sl = round(level-22,1)
-            score, bd, sg, tp1, tp2, rr = calc_confidence("BUY",level,sl)
+            score, bd, sg, tp1, tp2, rr1, rr2 = calc_confidence("BUY",level,sl)
             if score >= 55:
-                setups.append({"dir":"BUY","entry":level,"sl":sl,"tp2":tp2,"rr":rr,"score":score,"desc":desc})
+                setups.append({"dir":"BUY","entry":level,"sl":sl,"tp2":tp2,"rr":rr2,"score":score,"desc":desc})
     if not setups:
         await update.message.reply_text(
             f"📊 No strong setups near {round(current,1)} right now.\n\n"
