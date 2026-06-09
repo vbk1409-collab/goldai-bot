@@ -1,13 +1,14 @@
 """
-GoldAI Telegram Bot v4
+GoldAI Telegram Bot v5
 ======================
-- Plain language output — no technical jargon
-- Natural input: SELL 4380 sl 4400
-- Verdict + Suggestions
-- No price API needed
+- No trend judgment — user decides direction
+- Plain language with explanations
+- Key level based TP
+- How to use reminder at end
 """
 
-import logging, time, math, os, requests
+import logging, time, math, os, requests, threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
@@ -19,7 +20,22 @@ logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s', level=logg
 log = logging.getLogger(__name__)
 
 # ================================================================
-# HISTORY CACHE — for indicators only
+# HEALTH SERVER
+# ================================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"GoldAI Bot running!")
+    def log_message(self, format, *args): pass
+
+def run_health():
+    port = int(os.environ.get("PORT", 8080))
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+
+# ================================================================
+# PRICE HISTORY CACHE
 # ================================================================
 
 _cache = {"history": [], "ts": 0}
@@ -46,38 +62,41 @@ def get_history():
 # INDICATORS
 # ================================================================
 
-def calc_rsi(closes, p=14):
-    if len(closes) < p+1: return 50.0
-    d = [closes[i]-closes[i-1] for i in range(1,len(closes))]
-    ag = sum(max(x,0) for x in d[-p:])/p + 1e-9
-    al = sum(abs(min(x,0)) for x in d[-p:])/p + 1e-9
-    return round(100-100/(1+ag/al), 1)
-
-def calc_ma(closes, p):
-    if len(closes) < p: return closes[-1] if closes else 4300
-    return round(sum(closes[-p:])/p, 2)
-
 def calc_atr(closes, p=14):
     if len(closes) < p+1: return 15.0
     trs = [abs(closes[i]-closes[i-1]) for i in range(1,len(closes))]
     return round(sum(trs[-p:])/p, 2)
+
+def calc_momentum(closes, p=5):
+    """Recent momentum — rising or falling"""
+    if len(closes) < p+1: return 0
+    recent = closes[-p:]
+    return recent[-1] - recent[0]
 
 # ================================================================
 # KEY LEVELS
 # ================================================================
 
 KEY_LEVELS = [
-    (4200,"Major support"), (4250,"Support zone"),
-    (4280,"Psychological"), (4300,"Support cluster"),
-    (4320,"Minor support"), (4350,"Structure level"),
-    (4380,"Resistance zone"), (4400,"Major level"),
-    (4420,"Intraday zone"),  (4440,"Watch zone"),
-    (4463,"Structure"),     (4488,"Key resistance"),
-    (4508,"Resistance"),    (4527,"Spike high"),
-    (4550,"Resistance"),    (4595,"Swing high"),
+    (4200,"Major support — long-term base"),
+    (4250,"Support zone"),
+    (4280,"Psychological level"),
+    (4300,"Support cluster"),
+    (4320,"Minor support"),
+    (4350,"Structure level — tested multiple times"),
+    (4380,"Flip zone — support turned resistance"),
+    (4400,"Major psychological level"),
+    (4420,"Intraday zone"),
+    (4440,"Watch zone"),
+    (4463,"Structure level"),
+    (4488,"Key resistance — tested multiple times"),
+    (4508,"Resistance zone"),
+    (4527,"Spike high — strong resistance"),
+    (4550,"Resistance cluster"),
+    (4595,"Recent swing high"),
 ]
 
-def nearest_levels(price, n=3):
+def nearest_levels(price, n=4):
     sup = sorted([(l,d) for l,d in KEY_LEVELS if l<price], key=lambda x:price-x[0])[:n]
     res = sorted([(l,d) for l,d in KEY_LEVELS if l>price], key=lambda x:x[0]-price)[:n]
     return sup, res
@@ -89,136 +108,164 @@ def at_key_level(price, thr=12):
     return None, None
 
 # ================================================================
-# CONFIDENCE ENGINE
+# CONFIDENCE ENGINE — no trend judgment
 # ================================================================
 
 def calc_confidence(direction, entry, sl):
     closes  = get_history()
     is_sell = direction.upper() == "SELL"
     score   = 0
-    breakdown   = []
+    breakdown   = []  # (text, explanation, points)
     suggestions = []
     sl_dist = abs(entry - sl)
 
-    rsi  = calc_rsi(closes)  if closes else 50.0
-    ma20 = calc_ma(closes,20) if closes else entry
-    ma50 = calc_ma(closes,50) if closes else entry
-    atr  = calc_atr(closes)  if closes else 15.0
+    atr      = calc_atr(closes) if closes else 15.0
+    momentum = calc_momentum(closes) if closes else 0
 
-    # ── TREND ──────────────────────────────────
-    if is_sell:
-        if ma20 < ma50:
-            score += 20
-            breakdown.append(("✅ Gold is in a downtrend — good direction for SELL", +20))
-        else:
-            score -= 20
-            breakdown.append(("❌ Gold is rising right now — risky to SELL", -20))
-            suggestions.append("Wait for gold to start falling before SELL")
-    else:
-        if ma20 > ma50:
-            score += 20
-            breakdown.append(("✅ Gold is in an uptrend — good direction for BUY", +20))
-        else:
-            score -= 20
-            breakdown.append(("❌ Gold is falling right now — risky to BUY", -20))
-            suggestions.append("Wait for gold to start rising before BUY")
-
-    # ── ENTRY ──────────────────────────────────
+    # ── ENTRY QUALITY ──────────────────────────
     level, desc = at_key_level(entry, 12)
     if level:
-        score += 20
-        breakdown.append((f"✅ Entry at a known price zone ({level})", +20))
+        score += 30
+        breakdown.append((
+            f"✅ Entry at key price zone ({level})",
+            f"Price has reacted at {level} before — good spot to watch for reversal",
+            +30
+        ))
     else:
         sup, res = nearest_levels(entry)
         if is_sell and res and res[0][0]-entry < 20:
-            score += 12
-            breakdown.append((f"✅ Entry near resistance zone {res[0][0]}", +12))
+            score += 18
+            breakdown.append((
+                f"✅ Entry near resistance zone {res[0][0]}",
+                f"Close to a known resistance — sellers may step in here",
+                +18
+            ))
         elif not is_sell and sup and entry-sup[0][0] < 20:
-            score += 12
-            breakdown.append((f"✅ Entry near support zone {sup[0][0]}", +12))
+            score += 18
+            breakdown.append((
+                f"✅ Entry near support zone {sup[0][0]}",
+                f"Close to a known support — buyers may step in here",
+                +18
+            ))
         else:
-            score -= 12
-            breakdown.append(("⚠️ Entry not near any key price zone", -12))
-            if is_sell and res:
-                suggestions.append(f"Better entry: {res[0][0]} — a known resistance zone")
-            elif not is_sell and sup:
-                suggestions.append(f"Better entry: {sup[0][0]} — a known support zone")
-
-    # ── MOMENTUM (plain language) ───────────────
-    if is_sell:
-        if rsi > 65:
-            score += 15
-            breakdown.append(("✅ Price has risen a lot — sellers likely to step in", +15))
-        elif rsi > 55:
-            score += 5
-            breakdown.append(("⚠️ Price still moving up — wait for rejection before SELL", +5))
-        elif rsi < 40:
             score -= 15
-            breakdown.append(("❌ Price already dropped a lot — bad timing to SELL", -15))
-            suggestions.append("Price fell too fast — wait for a bounce before SELL")
-    else:
-        if rsi < 35:
-            score += 15
-            breakdown.append(("✅ Price has fallen a lot — buyers likely to step in", +15))
-        elif rsi < 45:
-            score += 5
-            breakdown.append(("⚠️ Price still falling — wait for reversal sign before BUY", +5))
-        elif rsi > 60:
-            score -= 15
-            breakdown.append(("❌ Price already risen a lot — bad timing to BUY", -15))
-            suggestions.append("Price rose too fast — wait for a pullback before BUY")
+            sup2, res2 = nearest_levels(entry)
+            if is_sell and res2:
+                better = res2[0][0]
+                breakdown.append((
+                    f"⚠️ Entry not near a key price zone",
+                    f"No strong level nearby — consider waiting for price to reach {better} (resistance)",
+                    -15
+                ))
+                suggestions.append(f"Move entry to {better} — a stronger resistance zone")
+            elif not is_sell and sup2:
+                better = sup2[0][0]
+                breakdown.append((
+                    f"⚠️ Entry not near a key price zone",
+                    f"No strong level nearby — consider waiting for price to reach {better} (support)",
+                    -15
+                ))
+                suggestions.append(f"Move entry to {better} — a stronger support zone")
 
     # ── STOP LOSS ──────────────────────────────
-    if sl_dist < atr * 0.6:
-        score -= 15
-        better_sl = round(entry+atr*0.9,1) if is_sell else round(entry-atr*0.9,1)
-        breakdown.append((f"❌ Stop loss too close — easily hit by normal price movement", -15))
-        suggestions.append(f"Move SL to {better_sl} — safer distance from entry")
-    elif sl_dist <= atr * 2.5:
-        score += 15
-        breakdown.append((f"✅ Stop loss at a good distance ({sl_dist:.0f} pip)", +15))
+    if sl_dist < atr * 0.5:
+        score -= 20
+        better_sl = round(entry + atr*1.0, 1) if is_sell else round(entry - atr*1.0, 1)
+        breakdown.append((
+            f"❌ Stop loss too close ({sl_dist:.0f} pip)",
+            f"Normal price movement can hit this SL by accident — move to {better_sl} for safer distance",
+            -20
+        ))
+        suggestions.append(f"Widen SL to {better_sl} to avoid getting stopped out by noise")
+    elif sl_dist <= atr * 2.0:
+        score += 25
+        breakdown.append((
+            f"✅ Stop loss well-placed ({sl_dist:.0f} pip)",
+            f"Good distance — far enough to avoid noise, close enough to limit loss",
+            +25
+        ))
     else:
-        score += 5
-        breakdown.append((f"⚠️ Stop loss is wide ({sl_dist:.0f} pip) — reduces position size", +5))
+        score += 10
+        breakdown.append((
+            f"⚠️ Stop loss is wide ({sl_dist:.0f} pip)",
+            f"Wide SL means smaller position size to keep same risk amount",
+            +10
+        ))
 
-    # ── REWARD vs RISK ─────────────────────────
-    # TP based on nearest key levels, not fixed multipliers
-    sup, res = nearest_levels(entry)
-
+    # ── MOMENTUM TIMING ────────────────────────
     if is_sell:
-        # TP targets = support levels below entry
-        tp_levels = [l for l,d in sup if l < entry - sl_dist*0.5]
+        if momentum > atr * 0.3:
+            score -= 10
+            breakdown.append((
+                f"⚠️ Price is still moving up",
+                f"Momentum favors buyers right now — wait for price to stall or reject at entry",
+                -10
+            ))
+            suggestions.append("Wait for a red candle closing below entry before entering")
+        elif momentum < -atr * 0.3:
+            score += 15
+            breakdown.append((
+                f"✅ Price momentum turning down",
+                f"Sellers are gaining control — timing looks good for SELL",
+                +15
+            ))
+        else:
+            score += 5
+            breakdown.append((
+                f"➖ Price momentum neutral",
+                f"No strong direction yet — watch for confirmation before entering",
+                +5
+            ))
+            suggestions.append("Wait for a clear rejection candle at entry")
+    else:
+        if momentum < -atr * 0.3:
+            score -= 10
+            breakdown.append((
+                f"⚠️ Price is still moving down",
+                f"Momentum favors sellers right now — wait for price to stall or bounce at entry",
+                -10
+            ))
+            suggestions.append("Wait for a green candle closing above entry before entering")
+        elif momentum > atr * 0.3:
+            score += 15
+            breakdown.append((
+                f"✅ Price momentum turning up",
+                f"Buyers are gaining control — timing looks good for BUY",
+                +15
+            ))
+        else:
+            score += 5
+            breakdown.append((
+                f"➖ Price momentum neutral",
+                f"No strong direction yet — watch for confirmation before entering",
+                +5
+            ))
+            suggestions.append("Wait for a clear bounce candle at entry")
+
+    # ── TP based on key levels ──────────────────
+    sup, res = nearest_levels(entry)
+    if is_sell:
+        tp_levels = [l for l,d in sup if l < entry - sl_dist*0.3]
         tp1 = tp_levels[0] if len(tp_levels) >= 1 else round(entry - sl_dist*1.5, 1)
         tp2 = tp_levels[1] if len(tp_levels) >= 2 else round(entry - sl_dist*2.5, 1)
     else:
-        # TP targets = resistance levels above entry
-        tp_levels = [l for l,d in res if l > entry + sl_dist*0.5]
+        tp_levels = [l for l,d in res if l > entry + sl_dist*0.3]
         tp1 = tp_levels[0] if len(tp_levels) >= 1 else round(entry + sl_dist*1.5, 1)
         tp2 = tp_levels[1] if len(tp_levels) >= 2 else round(entry + sl_dist*2.5, 1)
 
     rr1 = round(abs(tp1-entry)/sl_dist, 1) if sl_dist > 0 else 1.5
     rr2 = round(abs(tp2-entry)/sl_dist, 1) if sl_dist > 0 else 2.5
-    rr  = rr2
 
-    if rr2 >= 2.5:
+    # RR score
+    if rr2 >= 2.0:
         score += 15
-        breakdown.append((f"✅ Good reward vs risk — worth the trade", +15))
     elif rr2 >= 1.5:
         score += 8
-        breakdown.append((f"⚠️ Reward vs risk is acceptable", +8))
     else:
-        score -= 12
-        breakdown.append((f"❌ Reward too small vs risk — not worth it", -12))
-        suggestions.append(f"Target further levels for better reward")
+        score -= 10
+        suggestions.append(f"Consider targeting {tp2} for better reward")
 
     score = max(5, min(95, score))
-
-    # Always add timing suggestion
-    if is_sell:
-        suggestions.append("Wait for a rejection candle at entry before entering")
-    else:
-        suggestions.append("Wait for a bounce candle at entry before entering")
-
     return score, breakdown, suggestions, tp1, tp2, rr1, rr2
 
 # ================================================================
@@ -244,21 +291,30 @@ def format_result(direction, entry, sl, score, breakdown, suggestions, tp1, tp2,
         f"CONFIDENCE  {conf_bar(score)}  {score}%  {get_verdict(score)}",
         "",
     ]
-    for reason, _ in breakdown:
-        lines.append(reason)
+
+    for title, explanation, _ in breakdown:
+        lines.append(title)
+        lines.append(f"   {explanation}")
+
     lines += [
         "",
         f"SL:  {sl}",
         f"TP1: {tp1}  (RR 1:{rr1})",
         f"TP2: {tp2}  (RR 1:{rr2})",
     ]
+
     if suggestions:
         lines += ["", "💡 How to improve:"]
         for s in suggestions:
             lines.append(f"   • {s}")
+
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━",
         "Your idea. Your decision. Always use SL.",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "Check another idea:",
+        "SELL 4380 sl 4400",
+        "BUY 4280 sl 4258",
     ]
     return "\n".join(lines)
 
@@ -287,18 +343,20 @@ def parse_trade(text):
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 GoldAI Bot — Free Trade Checker\n"
+        "🤖 GoldAI — Free Trade Checker\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Type your trade idea to check it:\n\n"
+        "Already have a trade idea?\n"
+        "Type it to check if it makes sense:\n\n"
         "SELL 4380 sl 4400\n"
         "BUY 4280 sl 4258\n\n"
+        "Format: [BUY or SELL] [entry price] sl [stop loss]\n\n"
         "Other tools:\n"
-        "/scan — find setups now\n"
-        "/levels — price zones map\n"
-        "/pos 1000 2 4380 4400 — lot size\n"
+        "/scan — find setups near current price\n"
+        "/levels — key support & resistance zones\n"
+        "/pos 1000 2 4380 4400 — lot size calculator\n"
         "/help — all commands\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Just type — no command needed"
+        "XAU/USD Gold only · Free forever"
     )
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -306,16 +364,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     result = parse_trade(text)
     if not result:
         await update.message.reply_text(
-            "Type your trade idea like this:\n\n"
+            "Type your trade idea to check it:\n\n"
             "SELL 4380 sl 4400\n"
             "BUY 4280 sl 4258\n\n"
             "SELL = you think price goes down\n"
             "BUY  = you think price goes up\n"
             "sl   = your stop loss price\n\n"
-            "For SELL: stop loss must be above entry\n"
-            "For BUY:  stop loss must be below entry"
+            "SELL: stop loss must be above entry\n"
+            "BUY:  stop loss must be below entry"
         )
         return
+
     direction, entry, sl = result
     await update.message.reply_text("Analyzing... ⏳")
     score, breakdown, suggestions, tp1, tp2, rr1, rr2 = calc_confidence(direction, entry, sl)
@@ -328,51 +387,64 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     closes = get_history()
     if not closes:
         await update.message.reply_text("⚠️ Data unavailable. Try again."); return
+
     current = closes[-1]
     sup, res = nearest_levels(current, 2)
     setups = []
+
     for level, desc in res:
         if abs(level-current) < 50:
-            sl = round(level+22,1)
-            score, bd, sg, tp1, tp2, rr1, rr2 = calc_confidence("SELL",level,sl)
+            sl = round(level+20, 1)
+            score, bd, sg, tp1, tp2, rr1, rr2 = calc_confidence("SELL", level, sl)
             if score >= 55:
-                setups.append({"dir":"SELL","entry":level,"sl":sl,"tp2":tp2,"rr":rr2,"score":score,"desc":desc})
+                setups.append({"dir":"SELL","entry":level,"sl":sl,"tp1":tp1,"tp2":tp2,"rr1":rr1,"rr2":rr2,"score":score,"desc":desc})
+
     for level, desc in sup:
         if abs(current-level) < 50:
-            sl = round(level-22,1)
-            score, bd, sg, tp1, tp2, rr1, rr2 = calc_confidence("BUY",level,sl)
+            sl = round(level-20, 1)
+            score, bd, sg, tp1, tp2, rr1, rr2 = calc_confidence("BUY", level, sl)
             if score >= 55:
-                setups.append({"dir":"BUY","entry":level,"sl":sl,"tp2":tp2,"rr":rr2,"score":score,"desc":desc})
+                setups.append({"dir":"BUY","entry":level,"sl":sl,"tp1":tp1,"tp2":tp2,"rr1":rr1,"rr2":rr2,"score":score,"desc":desc})
+
     if not setups:
         await update.message.reply_text(
             f"📊 No strong setups near {round(current,1)} right now.\n\n"
-            "Type your own idea to check it:\n"
+            "Price is between key levels.\n"
+            "Check your own idea:\n"
             "SELL 4380 sl 4400"
         ); return
+
     lines = ["━━━━━━━━━━━━━━━━━━━━━━",
              f"🤖 GoldAI Scan | {round(current,1)}",
              "━━━━━━━━━━━━━━━━━━━━━━"]
-    for s in sorted(setups,key=lambda x:x['score'],reverse=True)[:3]:
+
+    for s in sorted(setups, key=lambda x:x['score'], reverse=True)[:3]:
         em = "📉" if s['dir']=="SELL" else "📈"
-        lines += [f"{em} {s['dir']} @ {s['entry']}  {get_verdict(s['score'])}  {s['score']}%",
-                  f"   SL: {s['sl']} | TP: {s['tp2']} | RR 1:{s['rr']}",
-                  f"   {s['desc']}", ""]
-    lines.append("Type to check: SELL 4380 sl 4400")
+        lines += [
+            f"{em} {s['dir']} @ {s['entry']}  {get_verdict(s['score'])}  {s['score']}%",
+            f"   SL: {s['sl']}",
+            f"   TP1: {s['tp1']} (RR 1:{s['rr1']})  TP2: {s['tp2']} (RR 1:{s['rr2']})",
+            f"   {s['desc']}", ""
+        ]
+
+    lines += ["━━━━━━━━━━━━━━━━━━━━━━",
+              "Check a setup: SELL 4380 sl 4400"]
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_levels(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     closes = get_history()
-    current = round(closes[-1],1) if closes else 4300
+    current = round(closes[-1], 1) if closes else 4300
     sup, res = nearest_levels(current, 4)
+
     lines = ["━━━━━━━━━━━━━━━━━━━━━━",
-             "📍 XAU/USD Price Zones",
+             "📍 XAU/USD Key Price Zones",
              "━━━━━━━━━━━━━━━━━━━━━━",
              "🔴 RESISTANCE (above):"]
     for level, desc in reversed(res):
-        lines.append(f"   {level}  (+{round(level-current,1)} pip)  {desc}")
+        lines.append(f"   {level}  +{round(level-current,1)} pip  {desc}")
     lines += ["", f"📍 NOW → {current}", "", "🟢 SUPPORT (below):"]
     for level, desc in sup:
-        lines.append(f"   {level}  (-{round(current-level,1)} pip)  {desc}")
+        lines.append(f"   {level}  -{round(current-level,1)} pip  {desc}")
     lines += ["━━━━━━━━━━━━━━━━━━━━━━",
               "Check a zone: SELL 4380 sl 4400"]
     await update.message.reply_text("\n".join(lines))
@@ -389,21 +461,28 @@ async def cmd_pos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         entry=float(args[2]);   sl=float(args[3])
     except:
         await update.message.reply_text("Invalid numbers."); return
+
     sl_dist  = abs(entry-sl)
     risk_amt = balance*risk_pct/100
-    lot      = max(0.01,round(risk_amt/(sl_dist*10),2))
+    lot      = max(0.01, round(risk_amt/(sl_dist*10), 2))
     direction= "SELL" if entry>sl else "BUY"
-    lines = ["━━━━━━━━━━━━━━━━━━━━━━",
-             f"💰 Lot Size | {direction} @ {entry}",
-             "━━━━━━━━━━━━━━━━━━━━━━",
-             f"Balance:  ${balance:,.0f}",
-             f"Risk:     {risk_pct}% = ${risk_amt:.0f}",
-             f"SL:       {sl_dist:.0f} pip away",
-             "", f"📊 LOT SIZE: {lot} oz", "",
-             "🎯 Take Profit:"]
-    for mult,label in [(1,"1:1"),(1.5,"1:1.5"),(2,"1:2"),(3,"1:3")]:
-        tp = round(entry-sl_dist*mult if direction=="SELL" else entry+sl_dist*mult,1)
-        lines.append(f"   {label}  {tp}  +${round(risk_amt*mult,0):.0f}")
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"💰 Position Size | {direction} @ {entry}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"Balance:   ${balance:,.0f}",
+        f"Risk:      {risk_pct}% = ${risk_amt:.0f}",
+        f"SL:        {sl_dist:.0f} pip away",
+        "",
+        f"📊 LOT SIZE:  {lot} oz",
+        f"Pip value:    ${lot*10:.2f} per pip",
+        "",
+        "🎯 Take Profit targets:",
+    ]
+    for mult, label in [(1,"1:1"),(1.5,"1:1.5"),(2,"1:2"),(3,"1:3")]:
+        tp = round(entry-sl_dist*mult if direction=="SELL" else entry+sl_dist*mult, 1)
+        lines.append(f"   {label}  →  {tp}  +${round(risk_amt*mult):.0f}")
     lines += ["━━━━━━━━━━━━━━━━━━━━━━",
               "Never risk more than 2% per trade."]
     await update.message.reply_text("\n".join(lines))
@@ -416,42 +495,24 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "SELL 4380 sl 4400\n"
         "BUY 4280 sl 4258\n\n"
         "Commands:\n"
-        "/scan — find top setups now\n"
-        "/levels — support & resistance zones\n"
+        "/scan — top setups near current price\n"
+        "/levels — key support & resistance zones\n"
         "/pos 1000 2 4380 4400 — lot size\n"
         "/help — this message\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "XAU/USD Gold only | Free forever"
+        "XAU/USD Gold only · Free forever"
     )
 
 # ================================================================
 # MAIN
 # ================================================================
 
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"GoldAI Bot is running!")
-    def log_message(self, format, *args):
-        pass  # Suppress logs
-
-def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
-
 def main():
     if not BOT_TOKEN or BOT_TOKEN=="YOUR_BOT_TOKEN_HERE":
         print("[ERROR] Set BOT_TOKEN env variable"); return
-    log.info("GoldAI Bot v4 starting...")
 
-    # Start health check server in background
-    t = threading.Thread(target=run_health_server, daemon=True)
-    t.start()
+    log.info("GoldAI Bot v5 starting...")
+    threading.Thread(target=run_health, daemon=True).start()
     log.info("Health server started")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
