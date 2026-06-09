@@ -168,16 +168,18 @@ def calc_confidence(direction, entry, sl):
                 suggestions.append(f"Move entry to {better} — a stronger support zone")
 
     # ── STOP LOSS ──────────────────────────────
-    if sl_dist < atr * 0.5:
+    # XAU/USD realistic thresholds
+    # <15 pip = too tight, 15-50 pip = good, >50 pip = wide
+    if sl_dist < 15:
         score -= 20
-        better_sl = round(entry + atr*1.0, 1) if is_sell else round(entry - atr*1.0, 1)
+        better_sl = round(entry + 20, 1) if is_sell else round(entry - 20, 1)
         breakdown.append((
             f"❌ Stop loss too close ({sl_dist:.0f} pip)",
-            f"Normal price movement can hit this SL by accident — move to {better_sl} for safer distance",
+            f"Normal gold movement can hit this SL by accident — move to {better_sl} for safer distance",
             -20
         ))
-        suggestions.append(f"Widen SL to {better_sl} to avoid getting stopped out by noise")
-    elif sl_dist <= atr * 2.0:
+        suggestions.append(f"Widen SL to {better_sl} — minimum 20 pip for gold")
+    elif sl_dist <= 50:
         score += 25
         breakdown.append((
             f"✅ Stop loss well-placed ({sl_dist:.0f} pip)",
